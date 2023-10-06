@@ -1,4 +1,4 @@
-project(server01)
+project(server02)
 
 set(SRC
     main.cpp

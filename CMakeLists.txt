@@ -14,5 +14,6 @@ SET(CMAKE_TOOLCHAIN_FILE "E:/DockerRepo/vcpkg/scripts/buildsystems/vcpkg.cmake")
 set(CMAKE_PREFIX_PATH "E:/DockerRepo/vcpkg/installed/x64-windows-static" ${CMAKE_PREFIX_PATH})
 
 find_package(Spdlog CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 
 add_subdirectory(examples)

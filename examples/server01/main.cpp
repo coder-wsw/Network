@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
 #include <winsock2.h>
+#include <zlib.h>
 
 #define BUF_SIZE 1024
 #define BUF_SMALL_SIZE 100
@@ -28,16 +30,14 @@ int main(int argc, char* argv[])
     WSADATA wsaData;
     SOCKET hServSock, hClntSock;
     SOCKADDR_IN servAddr, clntAddr;
-    int szClntAddr;
     HANDLE hThread;
+    int szClntAddr;
     if (argc != 2) {
         printf("Usage : %s <port>\n", argv[0]);
         exit(1);
     }
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
         error_handling("WSAStartup() error!");
-    SPDLOG_INFO("WAADATA: {},{},{},{}", wsaData.wVersion, wsaData.wHighVersion,
-                wsaData.szDescription, wsaData.szSystemStatus);
     hServSock = socket(PF_INET, SOCK_STREAM, 0);
     if (hServSock == INVALID_SOCKET)
         error_handling("socket() error!");
@@ -45,21 +45,26 @@ int main(int argc, char* argv[])
     servAddr.sin_family = AF_INET;
     servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servAddr.sin_port = htons(atoi(argv[1]));
+    // SPDLOG_INFO("servAddr.addr: {}", servAddr.sin_addr.s_addr);
     if (bind(hServSock, (SOCKADDR*)&servAddr, sizeof(servAddr)) == SOCKET_ERROR)
         error_handling("bind() error!");
-    if (listen(hServSock, 5) == SOCKET_ERROR)
+    if (listen(hServSock, 1) == SOCKET_ERROR)
         error_handling("listen() error!");
     while (1) {
-        szClntAddr = sizeof(clntAddr);
         hClntSock = accept(hServSock, (SOCKADDR*)&clntAddr, &szClntAddr);
-        hThread = (HANDLE)_beginthreadex(NULL, 0, RequestHandler,
-                                         (void*)&hClntSock, 0, NULL);
-
-        char reqLine[BUF_SIZE];
-        recv(hClntSock, reqLine, BUF_SIZE, 0);
-        std::cout << "reqLine: " << reqLine << std::endl;
+        if (hClntSock < 0) {
+            if (errno == EAGAIN || errno == EMFILE || errno == ENFILE)
+                break;
+            else if (errno == ECONNABORTED)
+                continue;
+            else
+                break;
+        }
+        std::thread t(RequestHandler, (void*)&hClntSock);
+        t.detach();
         printf("Connected client IP: %s \n", inet_ntoa(clntAddr.sin_addr));
     }
+    SPDLOG_INFO("close socket");
     closesocket(hServSock);
     WSACleanup();
     return 0;
@@ -72,22 +77,26 @@ unsigned WINAPI RequestHandler(void* arg)
     char method[BUF_SMALL_SIZE];
     char ct[BUF_SMALL_SIZE];
     char fileName[BUF_SMALL_SIZE];
-    recv(hClntSock, reqLine, BUF_SIZE, 0);
-    // std::cout << "reqLine: " << reqLine << std::endl;
-    // printf("reqLine: %s \n",reqLine);
-    // SPDLOG_INFO("reqLine: {}", reqLine);
+    // SPDLOG_INFO("hClntSock: {}", hClntSock);
+    auto rtn = recv(hClntSock, reqLine, BUF_SIZE, 0);
+    if (rtn == SOCKET_ERROR) {
+        SPDLOG_INFO("recv error");
+        return 1;
+    }
+    SPDLOG_INFO("reqLine: {}", reqLine);
     if (strstr(reqLine, "HTTP/") == NULL) {
         SendErrorMSG(hClntSock);
         closesocket(hClntSock);
         return 1;
     }
-    strcpy(method, strtok(reqLine, " /"));
+    strcpy_s(method, strtok(reqLine, " /"));
     if (strcmp(method, "GET")) {
         SendErrorMSG(hClntSock);
         closesocket(hClntSock);
         return 1;
     }
     strcpy(fileName, strtok(NULL, " /"));
+    SPDLOG_INFO("fileName: {}", fileName);
     strcpy(ct, ContentType(fileName));
     SendData(hClntSock, ct, fileName);
     return 0;
@@ -95,26 +104,77 @@ unsigned WINAPI RequestHandler(void* arg)
 
 void SendData(SOCKET sock, char* ct, char* filename)
 {
-    char protocol[] = "HTTP/1.0 200 OK\r\n";
-    char server[] = "Server:Linux Web Server \r\n";
-    char cntLen[] = "Content-length:2048\r\n";
+    char protocol[] = "HTTP/1.1 200 OK\r\n";
+    char server[] = "Server:Linux Web Server\r\n";
+    char cntEnc[] = "Content-Encoding: gzip\r\n";
     char cntType[BUF_SMALL_SIZE];
     char buf[BUF_SIZE];
-    FILE* sendFile;
+    z_stream c_stream;
+    size_t total_in = 0, gzip_in, bound_size;
 
-    sprintf(cntType, "Content-type:%s\r\n\r\n", ct);
+    c_stream.zalloc = NULL;
+    c_stream.zfree = NULL;
+    c_stream.opaque = NULL;
+    if (deflateInit2(&c_stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 | 16, 8,
+                     Z_DEFAULT_STRATEGY) != Z_OK) {
+        errno = EBADMSG;
+        return;
+    }
+    c_stream.avail_in = 0;
+    c_stream.avail_out = 0;
+    c_stream.total_in = 0;
+
+    gzip_in = c_stream.total_in;
+    FILE* sendFile;
+    sprintf(cntType, "Content-type:%s;\r\n\r\n", ct);
     if ((sendFile = fopen(filename, "rb")) == NULL) {
         SendErrorMSG(sock);
         return;
     }
 
+    fseek(sendFile, 0, SEEK_END); // 将文件指针移到文件末尾
+    long file_size = ftell(sendFile); // 获取当前文件指针位置，即文件长度
+    rewind(sendFile);                 // 将文件指针移到文件开头
+
+    char cntLen[BUF_SMALL_SIZE];
+    sprintf(cntLen, "Content-length:%ld\r\n", 1024);
     send(sock, protocol, strlen(protocol), 0);
     send(sock, server, strlen(server), 0);
     send(sock, cntLen, strlen(cntLen), 0);
+    send(sock, cntEnc, strlen(cntEnc), 0);
     send(sock, cntType, strlen(cntType), 0);
 
-    while (fgets(buf, BUF_SIZE, sendFile) != NULL)
-        send(sock, buf, strlen(buf), 0);
+    while (total_in < file_size) {
+        char* dest;
+        if (c_stream.avail_in == 0) {
+            auto size = fread(buf, 1, BUF_SIZE, sendFile);
+            c_stream.next_in = (Bytef*)buf;
+            c_stream.avail_in = size;
+        }
+
+        if (c_stream.avail_out == 0) {
+            bound_size = compressBound(c_stream.avail_in);
+            dest = (char*)malloc(bound_size);
+            c_stream.next_out = (Bytef*)dest;
+            c_stream.avail_out = bound_size;
+        }
+
+        if (deflate(&c_stream, Z_NO_FLUSH) != Z_OK) {
+            errno = EBADMSG;
+            return;
+        }
+        int encoded_size = c_stream.total_out - gzip_in;
+        send(sock, dest, encoded_size, 0);
+        sprintf(cntLen, "Content-length:%d\r\n", encoded_size);
+        send(sock, cntLen, strlen(cntLen), 0);
+
+        free(dest);
+        total_in += c_stream.total_in - gzip_in;
+        gzip_in = c_stream.total_in;
+    }
+
+    deflateEnd(&c_stream);
+    fclose(sendFile);
     closesocket(sock);
 }
 
